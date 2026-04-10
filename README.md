@@ -10,6 +10,8 @@
 
 This project implements a **Host Discovery Service** in a Software Defined Networking (SDN) environment using **Mininet** as the network emulator and the **POX controller** for centralized network control. The controller dynamically detects hosts via `packet_in` events, maintains a live host database, and installs OpenFlow flow rules to enable efficient, scalable packet forwarding — demonstrating core SDN principles end-to-end.
 
+A **two-switch, five-host topology** was chosen deliberately: it forces cross-switch host discovery, exercises the inter-switch link, and proves the controller maintains a global network view across multiple datapaths — not just a trivially single-switch scenario.
+
 ---
 
 ## 📌 Objectives
@@ -47,7 +49,7 @@ This project implements a **Host Discovery Service** in a Software Defined Netwo
 Make sure the following are installed on your system (tested on Ubuntu 20.04+):
 
 ```bash
-sudo apt-get install mininet python3
+sudo apt-get install mininet python3 iperf -y
 ```
 
 - [Mininet](https://mininet.org/) — network emulator
@@ -71,10 +73,12 @@ cp host_discovery.py ~/pox/ext/
 ├── README.md
 └── screenshots/
     ├── 1.png             # pingall result – full connectivity (Mininet CLI)
-    ├── 2.png             # Controller output – host discovery log
-    ├── 3.png             # Flow table dump (s1 & s2 via ovs-ofctl)
-    ├── 4.png             # Failure scenario – host unreachable
-    └── 5.png             # Host database – all 5 hosts discovered
+    ├── 2.png             # Controller output – host discovery log (POX terminal)
+    ├── 3.png             # Flow table dump – ovs-ofctl dump-flows s1 & s2
+    ├── 4.png             # Failure scenario – host unreachable (h2 down)
+    ├── 5.png             # Host database – all 5 hosts discovered and logged
+    ├── 6.png             # iperf throughput – h1 to h4 (127 Gbits/sec)
+    └── 7.png             # ping RTT – first packet vs steady state latency
 ```
 
 ---
@@ -161,18 +165,21 @@ mininet> pingall
 *** Results: 0% dropped (20/20 received)
 ```
 
-**Controller Log:**
-```
-[HOST JOIN] New host → MAC=00:00:00:00:00:01  IP=10.0.0.1  Switch=s1  Port=1
-[HOST JOIN] New host → MAC=00:00:00:00:00:02  IP=10.0.0.2  Switch=s1  Port=2
-...
-```
+**What's happening:** Every host's first packet triggers a `packet_in` event. The controller logs the host, installs a bidirectional flow rule, and subsequent pings are handled entirely by the switch. All 5 hosts across both switches successfully reach each other.
 
-**What's happening:** Every host's first packet triggers a `packet_in` event. The controller logs the host, installs a bidirectional flow rule, and subsequent pings are handled entirely by the switch.
+**Screenshot 1 — Mininet CLI: pingall result showing 0% packet loss**
 
-![Scenario 1 – pingall full connectivity (Mininet CLI)](screenshots/1.png)
+![Scenario 1 – pingall full connectivity](screenshots/1.png)
+
+**Screenshot 2 — POX Controller terminal: host join events and live host database updates**
 
 ![Scenario 1 – Controller host discovery log](screenshots/2.png)
+
+The controller log (screenshot 2) shows:
+- `[HOST JOIN]` events as each host sends its first packet
+- The host database printing after every new discovery with MAC, IP, switch DPID, port and timestamp
+- `[FLOOD]` events for unknown destinations before flow rules are installed
+- `[HOST UPDT]` events when a host is seen on a different switch port
 
 ---
 
@@ -184,14 +191,13 @@ mininet> h2 ifconfig h2-eth0 down
 mininet> h1 ping h2
 ```
 
-**Expected Output:**
-```
-From 10.0.0.1 icmp_seq=1 Destination Host Unreachable
-```
-
 **What's happening:** Bringing the interface down simulates a host failure. Since `h2` is no longer sending or receiving, ARP requests go unanswered and ICMP packets cannot be delivered. The idle timeout (20s) will eventually flush the stale flow rule from `s1`.
 
+**Screenshot 4 — Host failure: 100% packet loss, Destination Host Unreachable**
+
 ![Scenario 2 – Host failure / unreachable](screenshots/4.png)
+
+The output shows 27 packets transmitted with 0 received and 100% packet loss — confirming the controller correctly handles host absence and the network behaves as expected when a host goes offline.
 
 ---
 
@@ -199,22 +205,38 @@ From 10.0.0.1 icmp_seq=1 Destination Host Unreachable
 
 **Commands (run in a separate terminal while Mininet is active):**
 ```bash
-sudo ovs-ofctl dump-flows s1
-sudo ovs-ofctl dump-flows s2
-```
-
-**Sample Output:**
-```
-cookie=0x0, duration=5.3s, table=0, n_packets=5, priority=10,
-  ip,in_port=1,nw_src=10.0.0.1,nw_dst=10.0.0.2 actions=output:2
-
-cookie=0x0, duration=5.3s, table=0, n_packets=5, priority=10,
-  ip,in_port=2,nw_src=10.0.0.2,nw_dst=10.0.0.1 actions=output:1
+sudo ovs-ofctl dump-flows s1 | head -10
+sudo ovs-ofctl dump-flows s2 | head -10
 ```
 
 **What's happening:** After `pingall`, the controller has installed per-flow rules into each switch. Traffic no longer needs to traverse the controller — it's forwarded at line rate by the switch hardware.
 
+**Screenshot 3 — Flow table dump: installed rules on s1 and s2 with packet counts and timeouts**
+
 ![Scenario 3 – Flow table dump (s1 & s2)](screenshots/3.png)
+
+Key fields visible in each flow rule:
+- `idle_timeout=20, hard_timeout=60` — timeouts set by the controller
+- `n_packets=1, n_bytes=98` — packet counts confirming rules are being hit
+- `actions=output:N` — specific port forwarding, not flooding
+- `priority=65535` — high priority rules installed by POX via `ofp_match.from_packet()`
+
+---
+
+## 📌 Scenario 4 — Complete Host Database
+
+**Screenshot 5 — Full host database: all 5 hosts discovered with MAC, IP, switch, port, timestamp**
+
+![Results – Host database showing all 5 discovered hosts](screenshots/5.png)
+
+The host database shows all 5 hosts successfully discovered:
+- `00:00:00:00:00:01` → 10.0.0.1 on s1
+- `00:00:00:00:00:02` → 10.0.0.2 on s1
+- `00:00:00:00:00:03` → 10.0.0.3 on s1
+- `00:00:00:00:00:04` → 10.0.0.4 on s2
+- `00:00:00:00:00:05` → 10.0.0.5 on s2
+
+The two entries with random-looking MACs (`62:9c:66:a9:fd:14`, `3a:bf:d4:8c:97:ce`) are inter-switch link packets (LLDP/STP frames from OvS) — not actual hosts.
 
 ---
 
@@ -228,68 +250,64 @@ Run a 10-packet ping between hosts on different switches (h1 → h4, crossing th
 mininet> h1 ping -c 10 h4
 ```
 
-**Observed results:**
-
 | Ping # | RTT (ms) | Notes |
 |--------|----------|-------|
-| 1 | ~35–80 ms | First packet: packet_in → controller → flow install |
-| 2–10 | ~0.3–1.2 ms | Subsequent: switch hardware forwarding, no controller |
+| 1 | 6.03 ms | First packet: packet_in → controller → flow install |
+| 2 | 1.23 ms | Flow rule just installed, slight residual overhead |
+| 3–10 | 0.096–0.147 ms | Pure hardware forwarding, no controller involvement |
 
 ```
 PING 10.0.0.4 (10.0.0.4) 56(84) bytes of data.
-64 bytes from 10.0.0.4: icmp_seq=1 ttl=64 time=73.4 ms
-64 bytes from 10.0.0.4: icmp_seq=2 ttl=64 time=0.612 ms
-64 bytes from 10.0.0.4: icmp_seq=3 ttl=64 time=0.489 ms
-64 bytes from 10.0.0.4: icmp_seq=4 ttl=64 time=0.501 ms
-64 bytes from 10.0.0.4: icmp_seq=5 ttl=64 time=0.477 ms
+64 bytes from 10.0.0.4: icmp_seq=1 ttl=64 time=6.03 ms
+64 bytes from 10.0.0.4: icmp_seq=2 ttl=64 time=1.23 ms
+64 bytes from 10.0.0.4: icmp_seq=3 ttl=64 time=0.147 ms
+64 bytes from 10.0.0.4: icmp_seq=4 ttl=64 time=0.110 ms
+64 bytes from 10.0.0.4: icmp_seq=5 ttl=64 time=0.121 ms
+64 bytes from 10.0.0.4: icmp_seq=6 ttl=64 time=0.096 ms
+64 bytes from 10.0.0.4: icmp_seq=7 ttl=64 time=0.104 ms
+64 bytes from 10.0.0.4: icmp_seq=8 ttl=64 time=0.119 ms
+64 bytes from 10.0.0.4: icmp_seq=9 ttl=64 time=0.122 ms
+64 bytes from 10.0.0.4: icmp_seq=10 ttl=64 time=0.130 ms
 --- 10.0.0.4 ping statistics ---
-10 packets transmitted, 10 received, 0% packet loss
-rtt min/avg/max/mdev = 0.412/8.021/73.4/21.7 ms
+10 packets transmitted, 10 received, 0% packet loss, time 9175ms
+rtt min/avg/max/mdev = 0.096/0.821/6.032/1.768 ms
 ```
 
-**Interpretation:** The dramatic drop from ~73 ms (packet 1) to sub-millisecond (packets 2–10) directly confirms reactive flow installation. The first packet takes the slow path (controller round-trip); every subsequent packet takes the fast path (switch TCAM lookup only).
+**Interpretation:** The drop from 6.03 ms (packet 1) to sub-millisecond (packets 3–10) directly confirms reactive flow installation. Packet 2 shows a brief residual (~1.23 ms) as the newly installed rule propagates. From packet 3 onward the switch forwards entirely in hardware — 63× faster than the first packet. The `mdev` of 1.768 ms is dominated entirely by that one first-packet outlier.
+
+**Screenshot 7 — ping RTT: 6.03 ms first packet dropping to 0.096 ms steady state**
+
+![ping RTT – h1 to h4, first packet vs steady state](screenshots/7.png)
 
 ---
 
 ### Throughput — `iperf` Measurement
 
-Run iperf between hosts on different switches (h1 → h4) for 10 seconds:
+Run iperf between hosts on different switches (h1 → h4):
 
 ```
-mininet> iperf h1 h4
+mininet> h4 iperf -s &
+mininet> h1 iperf -c 10.0.0.4 -t 5
 ```
 
-**Observed results:**
-
 ```
-*** Iperf: testing TCP bandwidth between h1 and h4
-*** Results: ['19.7 Gbits/sec', '19.9 Gbits/sec']
-```
-
-| Direction | Throughput |
-|-----------|-----------|
-| h1 → h4 (sender) | ~19.7 Gbits/sec |
-| h4 → h1 (receiver) | ~19.9 Gbits/sec |
-
-**Interpretation:** After flow rule installation, the data plane operates entirely within OvS kernel space with no controller involvement. Mininet virtual links sustain near-line-rate throughput, confirming efficient kernel forwarding once flows are installed. Same-switch iperf (h1 → h2) yields similar results (~19–20 Gbits/sec) since both share the same OvS bridge.
-
----
-
-### Flow Table Statistics
-
-After `pingall`, inspect installed rules and packet counts:
-
-```bash
-sudo ovs-ofctl dump-flows s1 | grep -c "actions"    # count rules on s1
-sudo ovs-ofctl dump-flows s2 | grep -c "actions"    # count rules on s2
+Client connecting to 10.0.0.4, TCP port 5001
+TCP window size: 85.3 KByte (default)
+[ 1] local 10.0.0.1 port 52504 connected with 10.0.0.4 port 5001
+[ ID] Interval       Transfer     Bandwidth
+[ 1]  0.0000-5.0125 sec  74.2 GBytes  127 Gbits/sec
 ```
 
-| Switch | Rules installed after pingall |
-|--------|-------------------------------|
-| s1 | ~20 (bidirectional rules for all host pairs transiting s1) |
-| s2 | ~12 (rules for host pairs involving s2 hosts) |
+| Metric | Value |
+|--------|-------|
+| Transfer | 74.2 GBytes in 5 sec |
+| Bandwidth | 127 Gbits/sec |
 
-After 20 seconds of idle, rules expire automatically (`idle_timeout=20`). Rerunning `pingall` reinstalls them, confirming timeout behaviour.
+**Interpretation:** 127 Gbits/sec is expected in Mininet — virtual links operate entirely in kernel memory with no real NIC involved, so throughput reflects the host machine's memory bandwidth, not a physical network limit. This confirms that once flow rules are installed, the data plane forwards at maximum possible speed with zero controller involvement.
+
+**Screenshot 6 — iperf: 127 Gbits/sec throughput between h1 and h4**
+
+![iperf result – h1 to h4 throughput](screenshots/6.png)
 
 ---
 
@@ -298,24 +316,9 @@ After 20 seconds of idle, rules expire automatically (`idle_timeout=20`). Rerunn
 | Metric | First Packet | Subsequent Packets |
 |--------|-------------|-------------------|
 | **Path** | Host → Switch → Controller → Switch → Host | Host → Switch → Host |
-| **Latency** | ~35–80 ms (controller round-trip) | ~0.3–1.2 ms (hardware forwarding) |
+| **Latency** | 6.03 ms (controller round-trip) | 0.096–0.147 ms (hardware forwarding) |
 | **Controller load** | High (packet_in per new flow) | None (flow rule match) |
-| **Throughput** | N/A (single packet) | ~19–20 Gbits/sec (iperf) |
-
----
-
-## 📌 Results Summary
-
-| Objective | Status |
-|-----------|--------|
-| Dynamic host discovery | ✅ Achieved |
-| Host database maintenance | ✅ Achieved |
-| OpenFlow flow rule installation | ✅ Achieved |
-| Learning switch behavior | ✅ Achieved |
-| Failure handling | ✅ Verified |
-| Efficient forwarding post-discovery | ✅ Confirmed |
-
-![Results – Host database showing all 5 discovered hosts](screenshots/5.png)
+| **Throughput** | N/A (single packet) | 127 Gbits/sec (iperf, kernel memory) |
 
 ---
 
@@ -323,11 +326,13 @@ After 20 seconds of idle, rules expire automatically (`idle_timeout=20`). Rerunn
 
 The system was tested under the following conditions:
 
-- ✅ **Normal operation** — `pingall` confirms 0% packet loss and complete host discovery across both switches
-- ✅ **Failure condition** — host interface brought down (`h2 ifconfig h2-eth0 down`); unreachability confirmed via ICMP error messages
-- ✅ **Flow table inspection** — rules verified via `ovs-ofctl dump-flows` on both switches; packet counts and timeouts confirmed
-- ✅ **Timeout behaviour** — idle/hard timeouts cause rule eviction as expected; reinstalled on next `pingall`
-- ✅ **Performance validation** — first-ping RTT spike (~73 ms) confirms reactive flow installation; subsequent sub-ms RTT confirms hardware forwarding; `iperf` confirms ~19–20 Gbits/sec throughput post-installation
+- ✅ **Normal operation** — `pingall` confirms 0% packet loss (20/20 received) across both switches (screenshot 1)
+- ✅ **Controller logging** — host join events and live DB updates confirmed in POX terminal (screenshot 2)
+- ✅ **Flow table inspection** — rules verified via `ovs-ofctl dump-flows` on both switches with packet counts (screenshot 3)
+- ✅ **Failure condition** — host interface brought down; 100% packet loss and unreachability confirmed (screenshot 4)
+- ✅ **Host database** — all 5 hosts discovered with correct MAC, IP, switch, port mappings (screenshot 5)
+- ✅ **Throughput** — 127 Gbits/sec via iperf confirming hardware-speed forwarding after flow installation (screenshot 6)
+- ✅ **Latency** — 63× RTT reduction from first to subsequent packets proving reactive flow installation (screenshot 7)
 
 ---
 
@@ -349,3 +354,4 @@ This project successfully demonstrates a fully functional **SDN Host Discovery S
 - [POX Controller (noxrepo)](https://github.com/noxrepo/pox)
 - [OpenFlow 1.0 Specification](https://opennetworking.org/wp-content/uploads/2013/04/openflow-spec-v1.0.0.pdf)
 - [Open vSwitch Documentation](https://www.openvswitch.org/)
+- [Mininet Walkthrough](https://mininet.org/walkthrough/)
