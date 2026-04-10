@@ -1,6 +1,3 @@
-# Hello Harshal DO you know how this iss, You have been hacked!!!!!!!!!!!!!!!!
-# --Arin
-
 
 # 🌐 Host Discovery Service using SDN (Mininet + POX)
 
